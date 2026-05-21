@@ -46,13 +46,15 @@ def build_recommendations(
     if forecast is not None and not forecast.empty:
         fuel_cols = [col for col in FUEL_TARGET_COLUMNS if col in forecast.columns]
         if fuel_cols:
-            top_fuel = forecast[fuel_cols].sum().sort_values(ascending=False).index[0]
+            forecast_fuel = forecast[fuel_cols].sum().sort_values(ascending=False)
+            top_fuel = forecast_fuel.index[0]
+            top_share = forecast_fuel[top_fuel] / forecast_fuel.sum() if forecast_fuel.sum() else 0
             recommendations.append(
                 {
                     "level": "success",
                     "title": f"Подготовить запас {top_fuel.replace('sales_', '')}",
-                    "metric": f"{forecast[top_fuel].sum():,.0f} л".replace(",", " "),
-                    "body": "На прогнозном горизонте этот вид топлива даёт максимальный вклад в спрос.",
+                    "metric": f"{forecast_fuel[top_fuel]:,.0f} л · {top_share:.1%}".replace(",", " "),
+                    "body": "На прогнозном горизонте этот вид топлива имеет максимальный прогнозный объём среди видов топлива.",
                 }
             )
 

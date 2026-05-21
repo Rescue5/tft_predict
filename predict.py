@@ -16,7 +16,22 @@ def model_artifacts_exist(artifacts_dir: str | Path = DEFAULT_CONFIG.artifacts_d
     return all((root / filename).exists() for filename in required_files)
 
 
-def make_demo_forecast(data: pd.DataFrame, station_id: int, horizon: int = DEFAULT_CONFIG.forecast_horizon) -> pd.DataFrame:
+def make_demo_forecast(
+    data: pd.DataFrame,
+    station_id: int | None,
+    horizon: int = DEFAULT_CONFIG.forecast_horizon,
+) -> pd.DataFrame:
+    if station_id is None:
+        frames = [
+            make_demo_forecast(data, int(sid), horizon)
+            for sid in sorted(data["station_id"].dropna().unique().tolist())
+        ]
+        frames = [frame for frame in frames if not frame.empty]
+        if not frames:
+            return pd.DataFrame()
+        target_cols = [col for col in DEFAULT_CONFIG.targets if col in frames[0].columns]
+        return pd.concat(frames, ignore_index=True).groupby("timestamp", as_index=False)[target_cols].sum()
+
     station = data[data["station_id"] == station_id].sort_values("timestamp")
     numeric_targets = [col for col in DEFAULT_CONFIG.targets if col in station.columns]
     if station.empty or not numeric_targets:
@@ -104,7 +119,10 @@ def predict_with_saved_model(
             pdf = pdf.rename(columns={pdf.columns[0]: "timestamp"})
         pdf["station_id"] = sid
         frames.append(pdf)
-    return pd.concat(frames, ignore_index=True)
+    result = pd.concat(frames, ignore_index=True)
+    target_cols = [col for col in manifest.get("targets", config.targets) if col in result.columns]
+    result[target_cols] = result[target_cols].clip(lower=0)
+    return result
 
 
 def parse_args() -> argparse.Namespace:

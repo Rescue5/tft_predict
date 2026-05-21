@@ -13,7 +13,9 @@ from predict import make_demo_forecast, model_artifacts_exist, predict_with_save
 from recommendations import build_recommendations
 
 
-PAGE_TITLE = "TFT Fuel Demand Intelligence"
+PAGE_TITLE = "TFT-анализ спроса АЗС"
+# These factor tabs cover assignment inputs. Keep them on for the full task view.
+SHOW_FACTOR_TABS = False
 ACCENT = "#20E3B2"
 BLUE = "#5B8CFF"
 AMBER = "#FFB020"
@@ -305,7 +307,7 @@ def forecast_artifact_token() -> tuple[int, ...]:
 
 
 @st.cache_data(show_spinner="Building TFT forecast...")
-def load_tft_forecast(station_id: int, horizon: int, artifact_token: tuple[int, ...]) -> pd.DataFrame:
+def load_tft_forecast(station_id: int | None, horizon: int, artifact_token: tuple[int, ...]) -> pd.DataFrame:
     del artifact_token
     return predict_with_saved_model(
         data_path=DEFAULT_CONFIG.data_path,
@@ -318,7 +320,7 @@ def load_tft_forecast(station_id: int, horizon: int, artifact_token: tuple[int, 
 
 def make_dashboard_forecast(
     data: pd.DataFrame,
-    station_id: int,
+    station_id: int | None,
     horizon: int,
     model_ready: bool,
 ) -> tuple[pd.DataFrame, str, str | None]:
@@ -327,6 +329,9 @@ def make_dashboard_forecast(
 
     try:
         forecast = load_tft_forecast(station_id, horizon, forecast_artifact_token())
+        if station_id is None and not forecast.empty:
+            target_cols = [col for col in TARGET_COLUMNS if col in forecast.columns]
+            forecast = forecast.groupby("timestamp", as_index=False)[target_cols].sum()
         return forecast, "TFT forecast", None
     except Exception as exc:
         fallback = make_demo_forecast(data, station_id, horizon)
@@ -417,6 +422,78 @@ def station_ranking(df: pd.DataFrame, metric: str) -> pd.DataFrame:
     )
 
 
+def forecast_breakdown(
+    forecast: pd.DataFrame,
+    columns: list[str],
+    name_prefix: str,
+    value_column: str,
+) -> pd.DataFrame:
+    forecast_cols = [col for col in columns if col in forecast.columns]
+    if forecast.empty or not forecast_cols:
+        return pd.DataFrame()
+
+    totals = forecast[forecast_cols].clip(lower=0).sum().sort_values(ascending=False)
+    total_value = totals.sum()
+    breakdown = totals.rename(value_column).reset_index()
+    breakdown = breakdown.rename(columns={breakdown.columns[0]: "metric"})
+    breakdown["name"] = breakdown["metric"].str.replace(name_prefix, "", regex=False)
+    breakdown["share"] = breakdown[value_column] / total_value if total_value else 0
+    breakdown["Доля"] = breakdown["share"].map(lambda value: f"{value:.1%}")
+    return breakdown
+
+
+def history_with_forecast_chart(
+    history: pd.DataFrame,
+    future: pd.DataFrame,
+    columns: list[str],
+    title: str,
+    value_label: str,
+    colors: list[str],
+) -> go.Figure:
+    fig = go.Figure()
+    for index, col in enumerate(columns):
+        color = colors[index % len(colors)]
+        label = col.replace("sales_", "").replace("shop_", "")
+        fig.add_trace(
+            go.Scatter(
+                x=history["timestamp"],
+                y=history[col],
+                mode="lines",
+                name=label,
+                legendgroup=col,
+                line={"color": color, "width": 2},
+            )
+        )
+        if not future.empty and col in future.columns:
+            fig.add_trace(
+                go.Scatter(
+                    x=future["timestamp"],
+                    y=future[col],
+                    mode="lines",
+                    name=f"{label} · прогноз",
+                    legendgroup=col,
+                    showlegend=False,
+                    line={"color": color, "width": 2, "dash": "dash"},
+                )
+            )
+
+    if not future.empty:
+        fig.add_vline(
+            x=future["timestamp"].min(),
+            line_color="rgba(255,255,255,.35)",
+            line_dash="dot",
+        )
+    fig.update_layout(
+        template=plotly_template(),
+        title=title,
+        height=500,
+        xaxis_title="время",
+        yaxis_title=value_label,
+        legend_title_text="ряд",
+    )
+    return fig
+
+
 def correlation_chart(df: pd.DataFrame) -> go.Figure:
     candidates = [
         "total_fuel_sales",
@@ -472,7 +549,7 @@ def main() -> None:
             <div class="sidebar-brand">
                 <div class="brand-mark">T</div>
                 <div class="brand-name">TFT Intelligence</div>
-                <div class="brand-caption">Demand cockpit для сети АЗС. Фильтры управляют всеми графиками в реальном времени.</div>
+                <div class="brand-caption">Фильтры для анализа продаж, факторов спроса, прогноза и рекомендаций.</div>
             </div>
             """,
             unsafe_allow_html=True,
@@ -482,10 +559,13 @@ def main() -> None:
         aggregation = st.segmented_control("Агрегация", ["Час", "День", "Неделя"], default="День")
         horizon = st.select_slider("Горизонт прогноза", options=[24, 72, 168], value=168)
         min_date, max_date = data["timestamp"].dt.date.min(), data["timestamp"].dt.date.max()
-        date_range = st.date_input("Период", value=(min_date, max_date), min_value=min_date, max_value=max_date)
-        promo_only = st.toggle("Только промо/реклама", value=False)
-        rush_only = st.toggle("Только часы пик", value=False)
-        weekend_only = st.toggle("Только выходные", value=False)
+        date_range = st.slider(
+            "Период",
+            min_value=min_date,
+            max_value=max_date,
+            value=(min_date, max_date),
+            format="DD.MM.YYYY",
+        )
 
     filtered = data.copy()
     selected_station_id = None
@@ -495,29 +575,23 @@ def main() -> None:
     if isinstance(date_range, tuple) and len(date_range) == 2:
         start, end = pd.to_datetime(date_range[0]), pd.to_datetime(date_range[1]) + pd.Timedelta(days=1)
         filtered = filtered[(filtered["timestamp"] >= start) & (filtered["timestamp"] < end)]
-    if promo_only:
-        filtered = filtered[(filtered.get("promotion_fuel_active", 0) == 1) | (filtered.get("ad_active", 0) == 1)]
-    if rush_only and "is_rush_hour" in filtered:
-        filtered = filtered[filtered["is_rush_hour"] == 1]
-    if weekend_only and "is_weekend" in filtered:
-        filtered = filtered[filtered["is_weekend"] == 1]
 
-    status_text = "TFT artifacts available" if model_ready else "Model not loaded · exploratory + baseline mode"
+    status_text = "Артефакты TFT доступны" if model_ready else "TFT не загружена: показан baseline"
     dot_class = "dot" if model_ready else "dot off"
     st.markdown(
         f"""
         <div class="top-shell">
             <div class="hero-panel">
-                <div class="hero-kicker">Temporal Fusion Transformer · Fuel retail AI</div>
+                <div class="hero-kicker">Задание: TFT-анализ сети АЗС</div>
                 <h1>{PAGE_TITLE}</h1>
-                <div class="subtitle">Единый командный центр спроса: топливо, магазин, трафик, промо, цены конкурентов и прогнозный контур.</div>
+                <div class="subtitle">Факт продаж топлива и товаров, факторы спроса, прогнозы и рекомендации.</div>
                 <div class="accent-line"></div>
-                <div class="subtitle">Данные: {report['stations']} АЗС · {report['rows']:,} часов наблюдений · {len(manifest['targets'])} целевых метрик · {len(manifest['covariates'])} факторов спроса</div>
+                <div class="subtitle">Данные: {report['stations']} АЗС · {report['rows']:,} почасовых строк · {len(manifest['targets'])} целевых метрик · {len(manifest['covariates'])} факторов спроса</div>
             </div>
             <div class="command-stack">
                 <div class="status-pill"><span class="{dot_class}"></span>{status_text}</div>
                 <div class="command-chip"><div class="chip-label">Период данных</div><div class="chip-value">{report['start'][:10]} → {report['end'][:10]}</div></div>
-                <div class="command-chip"><div class="chip-label">Horizon</div><div class="chip-value">{horizon} часов</div></div>
+                <div class="command-chip"><div class="chip-label">Горизонт</div><div class="chip-value">{horizon} часов</div></div>
             </div>
         </div>
         """,
@@ -528,25 +602,31 @@ def main() -> None:
         card("Нет данных после фильтрации", "Ослабьте фильтры в левой панели.")
         return
 
-    current = filtered.tail(min(len(filtered), 24 * 14 * max(1, filtered["station_id"].nunique())))
+    current_end = filtered["timestamp"].max()
+    current = filtered[filtered["timestamp"] > current_end - pd.Timedelta(days=14)]
     kpis = [
-        ("Топливо", format_number(current["total_fuel_sales"].sum(), " л"), "последний активный срез"),
+        ("Топливо", format_number(current["total_fuel_sales"].sum(), " л"), "последние 14 дней выборки"),
         ("Магазин", format_number(current["shop_total_revenue"].sum(), " ₽"), "выручка сопутствующих товаров"),
         ("Трафик", format_number(current["total_traffic"].sum()), "все типы транспорта"),
-        ("АЗС", str(filtered["station_id"].nunique()), f"{report['rows_per_station_min']} ч / станция"),
-        ("Промо + реклама", f"{filtered[['promotion_fuel_active','ad_active']].max(axis=1).mean()*100:.1f}%", "доля активных часов"),
+        ("АЗС", str(current["station_id"].nunique()), "станций в текущем срезе"),
+        ("Промо + реклама", f"{current[['promotion_fuel_active','ad_active']].max(axis=1).mean()*100:.1f}%", "активные часы в срезе"),
     ]
+    st.caption("Карточки ниже - быстрые суммы по фактическим данным последних 14 дней выбранной выборки. Это не прогноз TFT.")
     st.markdown('<div class="kpi-grid">' + "".join(kpi_card(*item) for item in kpis) + "</div>", unsafe_allow_html=True)
 
-    tabs = st.tabs(["Обзор", "Прогноз", "Топливо", "Магазин", "Акции и реклама", "Трафик", "Цены", "Рекомендации"])
+    tab_names = ["Обзор данных", "Прогноз", "Топливо", "Магазин"]
+    if SHOW_FACTOR_TABS:
+        tab_names += ["Акции и реклама", "Трафик", "Цены"]
+    tab_names.append("Рекомендации")
+    tabs = dict(zip(tab_names, st.tabs(tab_names)))
     template_metrics = [metric, "total_fuel_sales", "shop_total_revenue", "total_traffic"]
     metrics = list(dict.fromkeys([col for col in template_metrics if col in filtered.columns]))
     aggregated = aggregate_by_period(filtered, aggregation, metrics)
-    forecast_station = selected_station_id if selected_station_id is not None else int(station_labels.iloc[0]["station_id"])
-    forecast, forecast_label, forecast_error = make_dashboard_forecast(data, forecast_station, horizon, model_ready)
+    forecast, forecast_label, forecast_error = make_dashboard_forecast(data, selected_station_id, horizon, model_ready)
+    forecast_scope = f"АЗС {selected_station_id}" if selected_station_id is not None else "вся сеть"
 
-    with tabs[0]:
-        section_header("Ситуационный обзор сети", "Network operating picture")
+    with tabs["Обзор данных"]:
+        section_header("Исторический обзор спроса", "Факт по выбранным фильтрам")
         c1, c2 = st.columns([1.35, 1])
         with c1:
             st.plotly_chart(line_chart(aggregated, metric, f"{metric}: динамика"), use_container_width=True)
@@ -562,10 +642,13 @@ def main() -> None:
         with c4:
             st.plotly_chart(fuel_mix_chart(filtered), use_container_width=True)
 
-    with tabs[1]:
-        forecast_caption = "Saved TFT model" if forecast_label == "TFT forecast" else "Hourly baseline"
-        section_header("Прогнозный контур", forecast_caption)
-        station_history = data[data["station_id"] == forecast_station].tail(24 * 21)
+    with tabs["Прогноз"]:
+        forecast_caption = "Сохраненная TFT-модель" if forecast_label == "TFT forecast" else "Baseline по часовому профилю"
+        section_header("Прогноз продаж", forecast_caption)
+        if selected_station_id is None:
+            station_history = data.groupby("timestamp", as_index=False)[[metric]].sum().tail(24 * 21)
+        else:
+            station_history = data[data["station_id"] == selected_station_id].tail(24 * 21)
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=station_history["timestamp"], y=station_history[metric], mode="lines", name="Факт", line={"color": ACCENT}))
         if not forecast.empty and metric in forecast.columns:
@@ -578,7 +661,7 @@ def main() -> None:
                     line={"color": AMBER, "dash": "dash"},
                 )
             )
-        fig.update_layout(template=plotly_template(), title=f"Прогноз {horizon} ч · станция {forecast_station}", height=460)
+        fig.update_layout(template=plotly_template(), title=f"Прогноз {horizon} ч · {forecast_scope}", height=460)
         st.plotly_chart(fig, use_container_width=True)
         if forecast_label == "TFT forecast":
             card("TFT-прогноз построен", "График и рекомендации используют сохранённые веса и препроцессоры из artifacts.")
@@ -591,71 +674,106 @@ def main() -> None:
                 "Показан baseline по часовому профилю последних данных. Для настоящего TFT-прогноза запустите train.py отдельно.",
             )
 
-    with tabs[2]:
-        section_header("Топливный микс", "Fuel demand decomposition")
+    with tabs["Топливо"]:
+        section_header("Продажи по видам топлива", "Целевая часть задания")
         fuel_cols = [col for col in FUEL_TARGET_COLUMNS if col in filtered.columns]
         fuel_agg = aggregate_by_period(filtered, aggregation, fuel_cols)
-        fig = px.area(fuel_agg, x="timestamp", y=fuel_cols, title="Продажи по видам топлива")
-        fig.update_layout(template=plotly_template(), height=500)
+        fuel_future = aggregate_by_period(forecast, aggregation, fuel_cols) if not forecast.empty else pd.DataFrame()
+        fig = history_with_forecast_chart(
+            fuel_agg,
+            fuel_future,
+            fuel_cols,
+            "Продажи по видам топлива: факт и прогноз",
+            "литры",
+            [BLUE, ACCENT, PINK, "#FF3B3B", "#7EE787", "#35C2FF", AMBER],
+        )
         st.plotly_chart(fig, use_container_width=True)
         st.dataframe(filtered[fuel_cols].sum().sort_values(ascending=False).to_frame("liters"), use_container_width=True)
+        fuel_forecast = forecast_breakdown(forecast, fuel_cols, "sales_", "Прогноз, л")
+        if not fuel_forecast.empty:
+            st.caption(f"Прогнозный состав спроса на горизонт {horizon} ч · {forecast_scope}.")
+            st.dataframe(
+                fuel_forecast[["name", "Прогноз, л", "Доля"]].rename(columns={"name": "Вид топлива"}),
+                hide_index=True,
+                use_container_width=True,
+            )
 
-    with tabs[3]:
-        section_header("Сопутствующие товары", "Retail revenue cockpit")
+    with tabs["Магазин"]:
+        section_header("Сопутствующие товары", "История выручки и категорий")
         shop_cols = [col for col in SHOP_TARGET_COLUMNS if col in filtered.columns]
         c1, c2 = st.columns([1.2, 1])
         with c1:
             shop_agg = aggregate_by_period(filtered, aggregation, ["shop_total_revenue"] + shop_cols)
-            fig = px.area(shop_agg, x="timestamp", y="shop_total_revenue", title="Выручка магазина")
-            fig.update_traces(line_color=VIOLET, fillcolor="rgba(155,140,255,.18)")
-            fig.update_layout(template=plotly_template(), height=430)
+            shop_future = (
+                aggregate_by_period(forecast, aggregation, ["shop_total_revenue"])
+                if not forecast.empty and "shop_total_revenue" in forecast.columns
+                else pd.DataFrame()
+            )
+            fig = history_with_forecast_chart(
+                shop_agg,
+                shop_future,
+                ["shop_total_revenue"],
+                "Выручка магазина: факт и прогноз",
+                "рубли",
+                [VIOLET],
+            )
+            fig.update_layout(height=430, showlegend=False)
             st.plotly_chart(fig, use_container_width=True)
         with c2:
             fig = px.pie(values=filtered[shop_cols].sum().values, names=[c.replace("shop_", "") for c in shop_cols], hole=.58)
             fig.update_layout(template=plotly_template(), title="Категории магазина", height=430)
             st.plotly_chart(fig, use_container_width=True)
-
-    with tabs[4]:
-        section_header("Акции и рекламная активность", "Promo impact scanner")
-        promo_cols = [col for col in ["promotion_fuel_active", "promotion_shop_active", "promotion_cafe_active", "ad_active"] if col in filtered]
-        promo = filtered.groupby("timestamp", as_index=False)[promo_cols + ["total_fuel_sales"]].mean()
-        fig = px.line(promo, x="timestamp", y=promo_cols, title="Активность промо и рекламы")
-        fig.update_layout(template=plotly_template(), height=380)
-        st.plotly_chart(fig, use_container_width=True)
-        impact = filtered.groupby("ad_active", as_index=False).agg(total_fuel_sales=("total_fuel_sales", "mean"), shop_total_revenue=("shop_total_revenue", "mean"))
-        st.dataframe(impact, use_container_width=True)
-
-    with tabs[5]:
-        section_header("Трафик и конверсия", "Vehicle flow intelligence")
-        traffic_cols = [col for col in filtered.columns if col.startswith("traffic_") and col != "traffic_Undefined"]
-        c1, c2 = st.columns([1.15, 1])
-        with c1:
-            traffic_agg = aggregate_by_period(filtered, aggregation, traffic_cols)
-            fig = px.area(traffic_agg, x="timestamp", y=traffic_cols, title="Трафик по типам транспорта")
-            fig.update_layout(template=plotly_template(), height=430)
-            st.plotly_chart(fig, use_container_width=True)
-        with c2:
-            fig = px.scatter(
-                filtered.sample(min(7000, len(filtered)), random_state=42),
-                x="total_traffic",
-                y="total_fuel_sales",
-                color="station_name",
-                title="Трафик → продажи топлива",
+        shop_forecast = forecast_breakdown(forecast, shop_cols, "shop_", "Прогноз, ₽")
+        if not shop_forecast.empty:
+            st.caption(f"Прогноз выручки категорий на горизонт {horizon} ч · {forecast_scope}.")
+            st.dataframe(
+                shop_forecast[["name", "Прогноз, ₽", "Доля"]].rename(columns={"name": "Категория"}),
+                hide_index=True,
+                use_container_width=True,
             )
-            fig.update_layout(template=plotly_template(), height=430, showlegend=False)
+
+    if SHOW_FACTOR_TABS:
+        with tabs["Акции и реклама"]:
+            section_header("Акции и рекламная активность", "Факторы спроса из данных")
+            promo_cols = [col for col in ["promotion_fuel_active", "promotion_shop_active", "promotion_cafe_active", "ad_active"] if col in filtered]
+            promo = filtered.groupby("timestamp", as_index=False)[promo_cols + ["total_fuel_sales"]].mean()
+            fig = px.line(promo, x="timestamp", y=promo_cols, title="Активность промо и рекламы")
+            fig.update_layout(template=plotly_template(), height=380)
             st.plotly_chart(fig, use_container_width=True)
+            impact = filtered.groupby("ad_active", as_index=False).agg(total_fuel_sales=("total_fuel_sales", "mean"), shop_total_revenue=("shop_total_revenue", "mean"))
+            st.dataframe(impact, use_container_width=True)
 
-    with tabs[6]:
-        section_header("Цены и конкурентная среда", "Pricing pressure monitor")
-        price_cols = [col for col in filtered.columns if col.startswith("price_") or col.startswith("competitor_price_")]
-        price_agg = filtered.set_index("timestamp").groupby(pd.Grouper(freq="D"))[price_cols].mean().reset_index()
-        fig = px.line(price_agg, x="timestamp", y=price_cols[:8], title="Собственные цены и цены конкурентов")
-        fig.update_layout(template=plotly_template(), height=440)
-        st.plotly_chart(fig, use_container_width=True)
-        st.plotly_chart(correlation_chart(filtered.sample(min(20000, len(filtered)), random_state=7)), use_container_width=True)
+        with tabs["Трафик"]:
+            section_header("Трафик по типам транспорта", "Фактор спроса из данных")
+            traffic_cols = [col for col in filtered.columns if col.startswith("traffic_") and col != "traffic_Undefined"]
+            c1, c2 = st.columns([1.15, 1])
+            with c1:
+                traffic_agg = aggregate_by_period(filtered, aggregation, traffic_cols)
+                fig = px.area(traffic_agg, x="timestamp", y=traffic_cols, title="Трафик по типам транспорта")
+                fig.update_layout(template=plotly_template(), height=430)
+                st.plotly_chart(fig, use_container_width=True)
+            with c2:
+                fig = px.scatter(
+                    filtered.sample(min(7000, len(filtered)), random_state=42),
+                    x="total_traffic",
+                    y="total_fuel_sales",
+                    color="station_name",
+                    title="Трафик → продажи топлива",
+                )
+                fig.update_layout(template=plotly_template(), height=430, showlegend=False)
+                st.plotly_chart(fig, use_container_width=True)
 
-    with tabs[7]:
-        section_header("Рекомендации", "Decision support")
+        with tabs["Цены"]:
+            section_header("Цены и конкурентная среда", "Факторы спроса из данных")
+            price_cols = [col for col in filtered.columns if col.startswith("price_") or col.startswith("competitor_price_")]
+            price_agg = filtered.set_index("timestamp").groupby(pd.Grouper(freq="D"))[price_cols].mean().reset_index()
+            fig = px.line(price_agg, x="timestamp", y=price_cols[:8], title="Собственные цены и цены конкурентов")
+            fig.update_layout(template=plotly_template(), height=440)
+            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(correlation_chart(filtered.sample(min(20000, len(filtered)), random_state=7)), use_container_width=True)
+
+    with tabs["Рекомендации"]:
+        section_header("Рекомендации", "Правила по факту и прогнозу")
         st.columns([1, 1])
         render_recommendations(filtered, forecast, selected_station_id)
         with st.expander("Preflight summary", expanded=False):
