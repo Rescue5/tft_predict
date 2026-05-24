@@ -1,5 +1,6 @@
 __pycache__/
 *.py[cod]
+.vscode/
 
 .pytest_cache/
 .mypy_cache/
@@ -7,6 +8,8 @@ __pycache__/
 .ipynb_checkpoints/
 
 artifacts/tb_logs/
+artifacts/training_runs/
+artifacts/training_uploads/
 
 .DS_Store
 Thumbs.db

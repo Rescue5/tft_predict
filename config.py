@@ -114,8 +114,8 @@ SHOP_TARGET_COLUMNS = [
 
 @dataclass(frozen=True)
 class ProjectConfig:
-    data_path: Path = ROOT_DIR / "detailed_data.csv"
-    metadata_path: Path = ROOT_DIR / "stations_metadata.csv"
+    data_path: Path = ROOT_DIR / "data" / "detailed_data.csv"
+    metadata_path: Path = ROOT_DIR / "data" / "stations_metadata.csv"
     artifacts_dir: Path = ROOT_DIR / "artifacts"
     timestamp_col: str = "timestamp"
     station_id_col: str = "station_id"

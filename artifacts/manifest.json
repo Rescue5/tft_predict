@@ -1,7 +1,7 @@
 {
   "config": {
-    "data_path": "detailed_data.csv",
-    "metadata_path": "stations_metadata.csv",
+    "data_path": "data/detailed_data.csv",
+    "metadata_path": "data/stations_metadata.csv",
     "artifacts_dir": "artifacts",
     "timestamp_col": "timestamp",
     "station_id_col": "station_id",
@@ -249,6 +249,8 @@
     ],
     "missing_targets": []
   },
+  "author": "ВПИШИ_СВОЕ_ФИО_ЗДЕСЬ",
+  "copyright": "Авторская проектная работа: ВПИШИ_СВОЕ_ФИО_ЗДЕСЬ. Использование без указания автора запрещено.",
   "station_ids": [
     0,
     1,

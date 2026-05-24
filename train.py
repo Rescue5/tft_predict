@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pickle
 from pathlib import Path
 
@@ -13,11 +14,21 @@ import os
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train Darts TFT model for Tatneft gas station analytics.")
-    parser.add_argument("--data", default=str(DEFAULT_CONFIG.data_path), help="Path to detailed_data.csv")
-    parser.add_argument("--metadata", default=str(DEFAULT_CONFIG.metadata_path), help="Path to stations_metadata.csv")
+    parser.add_argument("--data", default=str(DEFAULT_CONFIG.data_path), help="Path to data/detailed_data.csv")
+    parser.add_argument("--metadata", default=str(DEFAULT_CONFIG.metadata_path), help="Path to data/stations_metadata.csv")
     parser.add_argument("--output", default=str(DEFAULT_CONFIG.artifacts_dir), help="Artifacts directory")
     parser.add_argument("--epochs", type=int, default=15, help="Training epochs. Keep small for demo runs.")
     parser.add_argument("--station-limit", type=int, default=None, help="Optional station limit for smoke training.")
+    parser.add_argument("--input-chunk-length", type=int, default=DEFAULT_CONFIG.input_chunk_length)
+    parser.add_argument("--output-chunk-length", type=int, default=DEFAULT_CONFIG.output_chunk_length)
+    parser.add_argument("--hidden-size", type=int, default=64)
+    parser.add_argument("--lstm-layers", type=int, default=1)
+    parser.add_argument("--attention-heads", type=int, default=4)
+    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--random-state", type=int, default=42)
     parser.add_argument(
         "--precision",
         default="auto",
@@ -30,9 +41,33 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    config = ProjectConfig(data_path=Path(args.data), metadata_path=Path(args.metadata), artifacts_dir=Path(args.output))
+    project_author = os.getenv("TFT_PROJECT_AUTHOR", "Журавлев Данил Артемович")
+    config = ProjectConfig(
+        data_path=Path(args.data),
+        metadata_path=Path(args.metadata),
+        artifacts_dir=Path(args.output),
+        input_chunk_length=args.input_chunk_length,
+        output_chunk_length=args.output_chunk_length,
+        forecast_horizon=args.output_chunk_length,
+    )
     data, _metadata = load_source_data(config.data_path, config.metadata_path, config)
     frame, manifest = prepare_model_frame(data, config)
+    manifest["training_params"] = {
+        "input_chunk_length": args.input_chunk_length,
+        "output_chunk_length": args.output_chunk_length,
+        "hidden_size": args.hidden_size,
+        "lstm_layers": args.lstm_layers,
+        "attention_heads": args.attention_heads,
+        "dropout": args.dropout,
+        "batch_size": args.batch_size,
+        "epochs": args.epochs,
+        "learning_rate": args.learning_rate,
+        "weight_decay": args.weight_decay,
+        "precision": args.precision,
+        "random_state": args.random_state,
+    }
+    manifest["author"] = project_author
+    manifest["copyright"] = f"Авторская проектная работа: {project_author}. Использование без указания автора запрещено."
     manifest_path = save_manifest(manifest, config.artifacts_dir)
 
         # перед tb_logger = TensorBoardLogger(...)
@@ -109,23 +144,22 @@ def main() -> None:
     model = TFTModel(
         input_chunk_length=config.input_chunk_length,
         output_chunk_length=config.output_chunk_length,
-        hidden_size=64,
-        lstm_layers=1,
-        num_attention_heads=4,
-        dropout=0.1,
-        batch_size=64,
+        hidden_size=args.hidden_size,
+        lstm_layers=args.lstm_layers,
+        num_attention_heads=args.attention_heads,
+        dropout=args.dropout,
+        batch_size=args.batch_size,
         n_epochs=args.epochs,
-        optimizer_kwargs={"lr": 1e-4, "weight_decay": 1e-4},
+        optimizer_kwargs={"lr": args.learning_rate, "weight_decay": args.weight_decay},
         add_relative_index=True,
         add_encoders={"cyclic": {"future": ["hour", "dayofweek", "month"]}},
         use_static_covariates=True,
-        random_state=42,
+        random_state=args.random_state,
         pl_trainer_kwargs={
             "accelerator": accelerator,
             "devices": 1,
             "precision": precision,
             "enable_progress_bar": True,
-            # вот эти две строки важны
             "enable_checkpointing": True,
             "callbacks": [checkpoint_callback],
             "logger": tb_logger,
